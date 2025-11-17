@@ -2,28 +2,12 @@ pragma solidity ^0.8.14;
 
 import "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 import "@uniswap/v3-core/contracts/interfaces/IUniswapV3Factory.sol";
-// import "@uniswap/v3-core/contracts/interfaces/IUniswapV3PoolDeployer.sol";
-// import "../src/interfaces/IERC20.sol";
 
 contract PoolLauncher {
 
     address public factory;
     address public pool;
 
-
-
-// Addresses for Ethereum mainnet
-// address WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
-// address USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
-// uint24 fee = 3000; // 0.3%
- 
-// // Calculate sqrtPriceX96 for 2000 USDC per ETH
-// // WETH has 18 decimals, USDC has 6 decimals
-// uint256 price = 2000 * 10**6; // 2000 with USDC's 6 decimals
-// uint160 sqrtPriceX96 = calculateSqrtPriceX96(price, 6, 18);
- 
-// Create and initialize the pool
-// address pool = createAndInitializePool(USDC, WETH, fee, sqrtPriceX96);
     constructor(address _factory) {
         factory = _factory; 
     }

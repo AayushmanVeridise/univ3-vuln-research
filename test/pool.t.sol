@@ -6,7 +6,7 @@ import "forge-std/Test.sol";
 import "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 
 import {PoolLauncher} from "../src/poolLauncher.sol";
-import {LiquidityProvider} from "../src/liquditiyProvider.sol";
+import {LiquidityProvider} from "../src/LiquidityProvider.sol";
 import {TestToken} from "../src/token.sol";
 
 contract UniTest is Test {

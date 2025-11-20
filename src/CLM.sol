@@ -128,7 +128,6 @@ contract DemoCLMVault {
         // simplistic share calculation (for demo only)
         mintedShares = amount0 + amount1;
 
-        // if first depositor, totalShares may be 0
         if (totalShares == 0) {
             shares[msg.sender] = mintedShares;
         } else {
@@ -142,7 +141,6 @@ contract DemoCLMVault {
     /// @notice Users withdraw proportional share of free (non-LP) balances.
     /// @dev For simplicity, this does NOT remove liquidity from Uniswap; users
     ///      only get a share of tokens currently sitting idle in the vault.
-    ///      This is another subtle “gotcha” we can talk about later.
     function withdraw(uint256 shareAmount) external whenNotPaused returns (uint256 amount0Out, uint256 amount1Out) {
         require(shareAmount > 0, "zero shares");
         require(shareAmount <= shares[msg.sender], "insufficient shares");
@@ -150,7 +148,6 @@ contract DemoCLMVault {
         uint256 vaultToken0Bal = IERC20(token0).balanceOf(address(this));
         uint256 vaultToken1Bal = IERC20(token1).balanceOf(address(this));
 
-        // proportional share of free balances
         amount0Out = (vaultToken0Bal * shareAmount) / totalShares;
         amount1Out = (vaultToken1Bal * shareAmount) / totalShares;
 
@@ -171,7 +168,6 @@ contract DemoCLMVault {
 
     /// @notice Admin can open a new position using all idle balances.
     /// @dev Uses slot0 and positionWidth to set ticks, but DOES NOT apply TWAP check.
-    ///      This is a potential manipulation vector.
     function openPosition() external onlyAdmin whenNotPaused {
         require(currentPositionId == 0, "position exists");
 
@@ -182,7 +178,6 @@ contract DemoCLMVault {
 
         require(amount0 > 0 || amount1 > 0, "no funds");
 
-        // approve NFPM to pull from this vault
         IERC20(token0).approve(address(positionManager), amount0);
         IERC20(token1).approve(address(positionManager), amount1);
 
@@ -207,68 +202,57 @@ contract DemoCLMVault {
     }
 
     /// @notice Admin rebalances position in a "safe" way (with TWAP check).
-    /// @dev This path uses onlyCalmPeriods, but other paths won't (deliberate asymmetry).
     function rebalance() external onlyAdmin whenNotPaused onlyCalmPeriods {
         require(currentPositionId != 0, "no position");
-        _removeAllLiquidity();  // decrease + collect
+        _removeAllLiquidity();
         (int24 tickLower, int24 tickUpper) = _computeTicksFromSlot0();
         _addAllLiquidity(tickLower, tickUpper);
-        // In a fuller implementation, we’d also `harvest()` and auto-compound here.
     }
 
-    /// @notice Admin changes positionWidth and immediately redeploys liquidity
-    ///         WITHOUT TWAP check (intentionally unsafe).
+    /// @notice Admin changes positionWidth and redeploys liquidity WITHOUT TWAP check.
     function setPositionWidth(int24 _width) external onlyAdmin {
         emit PositionWidthSet(positionWidth, _width);
-        _claimEarnings();      // placeholder for fee collection logic
-        _removeAllLiquidity(); // remove liquidity at possibly honest price
+        _claimEarnings();
+        _removeAllLiquidity();
 
         positionWidth = _width;
 
-        // Updates ticks from pool.slot0 (spot, manipulable)
         (int24 tickLower, int24 tickUpper) = _computeTicksFromSlot0();
-
-        // BUG: redeploys liquidity without onlyCalmPeriods TWAP guard
         _addAllLiquidity(tickLower, tickUpper);
     }
 
-    /// @notice Pause the vault and remove liquidity (e.g. panic mode).
+    /// @notice Pause the vault and remove liquidity (panic).
     function pause() external onlyAdmin {
         paused = true;
         _removeAllLiquidity();
         emit Paused();
     }
 
-    /// @notice Unpause the vault and redeploy liquidity using slot0, WITHOUT TWAP check.
-    /// @dev Mimics the "unpause" bug described in the Beefy writeup.
+    /// @notice Unpause the vault and redeploy liquidity WITHOUT TWAP check.
     function unpause() external onlyAdmin {
         paused = false;
-        _giveAllowances(); // approve unirouter with max allowances
+        _giveAllowances();
         (int24 tickLower, int24 tickUpper) = _computeTicksFromSlot0();
-        // BUG: no TWAP guard here, can be sandwiched
         _addAllLiquidity(tickLower, tickUpper);
         emit Unpaused();
     }
 
     /// @notice Admin sets TWAP parameters (can render TWAP check ineffective).
     function setTwapParams(uint32 _interval, uint256 _maxDeviationBps) external onlyAdmin {
-        // No bounds, so admin can set interval=0 or huge maxDeviationBps.
         twapInterval = _interval;
         maxDeviationBps = _maxDeviationBps;
         emit TwapParamsSet(_interval, _maxDeviationBps);
     }
 
-    /// @notice Admin updates the router address.
-    /// @dev BUG: does NOT revoke allowances from old router.
+    /// @notice Admin updates the router address (does NOT revoke old approvals).
     function setUnirouter(address _unirouter) external onlyAdmin {
         unirouter = _unirouter;
         emit UnirouterSet(_unirouter);
     }
 
     /// @notice Admin updates performance fee.
-    /// @dev If updated after fees have accrued but before harvest, fees can be applied retroactively.
     function setPerformanceFeeBps(uint256 _performanceFeeBps) external onlyAdmin {
-        require(_performanceFeeBps <= 5_000, "fee too high"); // naive bound
+        require(_performanceFeeBps <= 5_000, "fee too high");
         performanceFeeBps = _performanceFeeBps;
         emit PerformanceFeeSet(_performanceFeeBps);
     }
@@ -282,19 +266,15 @@ contract DemoCLMVault {
     // Internal helpers
     // ------------------------------------------------
 
-    /// @dev Compute ticks around current slot0 tick using positionWidth.
-    ///      No tick-spacing handling; this can revert on real pools (fine for demo).
     function _computeTicksFromSlot0() internal view returns (int24 tickLower, int24 tickUpper) {
         (, int24 currentTick, , , , , ) = IUniswapV3Pool(pool).slot0();
         tickLower = currentTick - positionWidth;
         tickUpper = currentTick + positionWidth;
     }
 
-    /// @dev Remove all liquidity from current position and collect tokens.
     function _removeAllLiquidity() internal {
         if (currentPositionId == 0) return;
 
-        // Query position liquidity
         (
             ,
             ,
@@ -333,7 +313,6 @@ contract DemoCLMVault {
         }
     }
 
-    /// @dev Re-mint liquidity using all idle balances.
     function _addAllLiquidity(int24 tickLower, int24 tickUpper) internal {
         uint256 amount0 = IERC20(token0).balanceOf(address(this));
         uint256 amount1 = IERC20(token1).balanceOf(address(this));
@@ -360,40 +339,10 @@ contract DemoCLMVault {
         currentPositionId = tokenId;
     }
 
-    /// @dev Placeholder for reward collection (we can wire in fee logic later).
     function _claimEarnings() internal {
-        // For now, just a hook where we’d call positionManager.collect(...)
-        // and possibly _distributeFees(nativeEarned).
+        // placeholder for fee collection logic
     }
 
-    /// @dev Naive TWAP vs spot check. Can be disabled/abused via setTwapParams.
-function _checkTwap() internal view {
-    if (twapInterval == 0) {
-        // interval=0: effectively disabled, but we intentionally allow it
-        return;
-    }
-
-    // Spot tick
-    (, int24 spotTick, , , , , ) = IUniswapV3Pool(pool).slot0();
-
-    // TWAP tick over [now - twapInterval, now]
-    uint32;
-    secondsAgos[0] = twapInterval;
-    secondsAgos[1] = 0;
-
-    (int56[] memory tickCumulative, ) = IUniswapV3Pool(pool).observe(secondsAgos);
-    int56 delta = tickCumulative[1] - tickCumulative[0];
-    int24 twapTick = int24(delta / int56(int32(twapInterval)));
-
-    int256 diff = spotTick - twapTick;
-    int256 diffAbs = diff >= 0 ? diff : -diff;
-
-    // crude bps calculation: we treat ticks difference as proportional
-    // (not exact, but enough to illustrate abuse)
-    uint256 deviationBps = uint256(diffAbs); // 1 tick ~ 1 bps-ish for demo
-
-    require(deviationBps <= maxDeviationBps, "twap deviation too high");
-}
     /// @dev Naive TWAP vs spot check. Can be disabled/abused via setTwapParams.
     function _checkTwap() internal view {
         if (twapInterval == 0) {
@@ -405,7 +354,9 @@ function _checkTwap() internal view {
         (, int24 spotTick, , , , , ) = IUniswapV3Pool(pool).slot0();
 
         // TWAP tick over [now - twapInterval, now]
-        uint32;
+        
+        uint32[] memory secondsAgos = new uint32[](2);
+
         secondsAgos[0] = twapInterval;
         secondsAgos[1] = 0;
 
@@ -416,18 +367,10 @@ function _checkTwap() internal view {
         int256 diff = spotTick - twapTick;
         int256 diffAbs = diff >= 0 ? diff : -diff;
 
-        // crude bps calculation: we treat ticks difference as proportional
-        // (not exact, but enough to illustrate abuse)
-        uint256 deviationBps = uint256(diffAbs); // 1 tick ~ 1 bps-ish for demo
-
+        uint256 deviationBps = uint256(diffAbs); // crude mapping: 1 tick ~ 1 bps-ish
         require(deviationBps <= maxDeviationBps, "twap deviation too high");
     }
 
-
-
-    /// @dev Give unlimited approvals to unirouter for both tokens.
-    ///      This is called on unpause and is part of the "stale allowance" pitfall
-    ///      when setUnirouter does not revoke old router approvals.
     function _giveAllowances() internal {
         IERC20(token0).approve(unirouter, type(uint256).max);
         IERC20(token1).approve(unirouter, type(uint256).max);

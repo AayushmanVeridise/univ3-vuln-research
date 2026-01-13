@@ -112,7 +112,7 @@ contract CLMTest is Test {
         
         // Check user's shares in the CLM vault
         assertEq(clm.getShares(user), 2_000 ether);
-        assertEq(clm.totalShares(), 2_000 ether);
+        assertEq(clm.getTotalShares(), 2_000 ether);
     }
 
     function test_Withdraw() external {
@@ -133,7 +133,7 @@ contract CLMTest is Test {
 
         // Check the shares in the CLM vault
         assertEq(clm.getShares(user), 0);
-        assertEq(clm.totalShares(), 0);
+        assertEq(clm.getTotalShares(), 0);
         
     }
 

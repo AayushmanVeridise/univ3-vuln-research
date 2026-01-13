@@ -150,7 +150,7 @@ contract CLM {
     /// @param shareAmount amount of shares to withdraw
     function withdraw(uint256 shareAmount) external whenNotPaused returns (uint256 amount0Out, uint256 amount1Out) {
         require(shareAmount > 0, "Zero shares"); 
-        require(shareAmount <= shareToken.balanceOf(msg.sender);, "Insufficient Shares"); 
+        require(shareAmount <= shareToken.balanceOf(msg.sender), "Insufficient Shares"); 
 
         uint256 tokenAmounts = shareAmount / 2;
         require(tokenAmounts > 0); // sanity check
@@ -285,7 +285,7 @@ contract CLM {
     function getTotalShares() external view returns (uint256 totalShares) {
         totalShares = shareToken.totalSupply();
     }
-    
+
     function getLiquidity() external view returns (uint128 liquidity) {
         (, , , , , , , liquidity, , , , ) = positionManager.positions(currentPositionId);
     }

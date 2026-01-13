@@ -4,6 +4,9 @@ pragma solidity ^0.8.14;
 import "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 import "@uniswap/v3-periphery/contracts/interfaces/INonfungiblePositionManager.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+
+import "./utils/ShareToken.sol";
 
 contract CLM {
     address public immutable admin;
@@ -29,11 +32,10 @@ contract CLM {
     uint256 public performanceFeeBps; // e.g. 2000 = 20%
     address public feeRecipient;
 
-    // Basic share accounting 
-    uint256 public totalShares; 
-    mapping(address => uint256) public shares; 
-
     bool public paused; 
+
+    // Reward token
+    ShareToken public shareToken;
 
     // -------------------------------------------------
     // Events 
@@ -74,7 +76,7 @@ contract CLM {
     constructor(
         address _admin,
         address _token0, 
-        address _token1, 
+        address _token1,
         address _pool, 
         address _positionManager,
         address _unirouter
@@ -87,10 +89,13 @@ contract CLM {
 
         admin = _admin; 
         token0 = _token0; 
-        token1 = _token1; 
+        token1 = _token1;
         pool = _pool;
         positionManager = INonfungiblePositionManager(_positionManager);
         unirouter = _unirouter;
+
+        // Deploy ShareToken contract
+        shareToken = new ShareToken(address(this));
 
         // Default params (can be updated by admin later)
         positionWidth = 600;        // 10*60 tick spacing for a 0.3% pool
@@ -119,14 +124,21 @@ contract CLM {
             IERC20(token1).transferFrom(msg.sender, address(this), amount1); 
         }
 
-        // Share calculaton
-        mintedShares = amount0 + amount1; 
-        if (totalShares == 0) {
-            shares[msg.sender] = mintedShares; 
-        } else {
-            shares[msg.sender] += mintedShares;
-        }
-        totalShares += mintedShares;
+        uint8 token0Decimals = IERC20Metadata(token0).decimals();
+        uint8 token1Decimals = IERC20Metadata(token1).decimals();
+
+        uint256 token0Normalized = _getNormalized(amount0, token0Decimals);
+        uint256 token1Normalized = _getNormalized(amount1, token1Decimals);
+
+
+
+        uint256 shares = token0Normalized + token1Normalized; 
+        require(shares > 0, "Zero shares"); // sanity
+
+        // Mint the shares to the user
+        shareToken.mint(msg.sender, shares);
+
+        mintedShares = shares;
 
         emit Deposit(msg.sender, amount0, amount1, mintedShares); 
     }
@@ -138,10 +150,10 @@ contract CLM {
     /// @param shareAmount amount of shares to withdraw
     function withdraw(uint256 shareAmount) external whenNotPaused returns (uint256 amount0Out, uint256 amount1Out) {
         require(shareAmount > 0, "Zero shares"); 
-        require(shareAmount <= shares[msg.sender], "Insufficient Shares"); 
+        require(shareAmount <= shareToken.balanceOf(msg.sender);, "Insufficient Shares"); 
 
         uint256 tokenAmounts = shareAmount / 2;
-        require(tokenAmounts > 0);
+        require(tokenAmounts > 0); // sanity check
 
         uint256 vaultToken0Bal = IERC20(token0).balanceOf(address(this));
         uint256 vaulttoken1Bal = IERC20(token1).balanceOf(address(this));
@@ -150,10 +162,10 @@ contract CLM {
         require(vaultToken0Bal >= tokenAmounts);
         require(vaulttoken1Bal >= tokenAmounts);
 
-        // Accounting to reduce the shares 
-        shares[msg.sender] -=shareAmount;
-        totalShares -= shareAmount;
+        // Take shares from user
+        shareToken.transferFrom(msg.sender, address(this), shareAmount);
 
+        // Transfer the appropriate amount of tokens from the users
         IERC20(token0).transfer(msg.sender, tokenAmounts); 
         IERC20(token1).transfer(msg.sender, tokenAmounts); 
 
@@ -267,9 +279,13 @@ contract CLM {
     /// @param user The address to query the shares of
     ///
     function getShares(address user) external view returns (uint256 userShares) {
-        userShares = shares[user];
+        userShares = shareToken.balanceOf(user);
     }
 
+    function getTotalShares() external view returns (uint256 totalShares) {
+        totalShares = shareToken.totalSupply();
+    }
+    
     function getLiquidity() external view returns (uint128 liquidity) {
         (, , , , , , , liquidity, , , , ) = positionManager.positions(currentPositionId);
     }
@@ -314,16 +330,12 @@ contract CLM {
 
     }
 
-    // function _addLiquidity() internal {
-
-    // }
-    // function _removeLiquidity() internal {
-    //     if (currentPositionId == 0) {
-    //         return;
-    //     }
-
-
-    // }
+    function _addLiquidity() internal {
+        // TODO
+    }
+    function _removeLiquidity() internal {
+        // TODO
+    }
 
     /// @notice Removes All liqudity from the pool
     function _removeAllLiquidity() internal {
@@ -391,5 +403,20 @@ contract CLM {
     function _giveAllowances() internal {
         IERC20(token0).approve(unirouter, type(uint256).max); 
         IERC20(token1).approve(unirouter, type(uint256).max);
+    }
+
+    /// @notice This function normalizes the tokenAmount to 8 decimals 
+    function _getNormalized(uint256 tokenAmount, uint8 tokenDecimals) internal returns (uint256) {
+        // Reward token decimals = 8
+
+        uint256 normalizedDecimals = 8; 
+
+        if (tokenDecimals > 8) {
+            normalizedDecimals = 10 ** (tokenDecimals - 8);
+        } else {
+            normalizedDecimals = 10 ** (8 - tokenDecimals);
+        }
+
+        return (tokenAmount * normalizedDecimals);
     }
 }
